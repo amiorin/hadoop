@@ -9,15 +9,23 @@ import org.apache.mesos.Protos.*;
 import org.apache.mesos.Protos.TaskID;
 import org.apache.mesos.Protos.TaskStatus;
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
-import java.io.IOException;
-import java.io.StringWriter;
+import java.io.*;
+
+import java.lang.reflect.Field;
+import java.lang.ReflectiveOperationException;
+
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class MesosExecutor implements Executor {
   public static final Log LOG = LogFactory.getLog(MesosExecutor.class);
   private SlaveInfo slaveInfo;
   private TaskTracker taskTracker;
+
+  protected final ScheduledExecutorService timerScheduler =
+       Executors.newScheduledThreadPool(1);
 
   public static void main(String[] args) {
     MesosExecutorDriver driver = new MesosExecutorDriver(new MesosExecutor());
@@ -30,7 +38,7 @@ public class MesosExecutor implements Executor {
       byte[] bytes = task.getData().toByteArray();
       conf.readFields(new DataInputStream(new ByteArrayInputStream(bytes)));
     } catch (IOException e) {
-      LOG.warn("Failed to deserialize configuraiton.", e);
+      LOG.warn("Failed to deserialize configuration.", e);
       System.exit(1);
     }
 
@@ -50,9 +58,14 @@ public class MesosExecutor implements Executor {
     // to the JobTracker.
     conf.set("slave.host.name", slaveInfo.getHostname());
 
+    String sandbox = System.getenv("MESOS_SANDBOX");
+    if (sandbox == null || sandbox.equals("")) {
+      sandbox = System.getenv("MESOS_DIRECTORY");
+    }
+
     // Set the mapred.local directory inside the executor sandbox, so that
     // different TaskTrackers on the same host do not step on each other.
-    conf.set("mapred.local.dir", System.getProperty("user.dir") + "/mapred");
+    conf.set("mapred.local.dir", sandbox + "/mapred");
 
     return conf;
   }
@@ -124,14 +137,22 @@ public class MesosExecutor implements Executor {
   }
 
   @Override
-  public void killTask(ExecutorDriver driver, TaskID taskId) {
+  public void killTask(final ExecutorDriver driver, final TaskID taskId) {
     LOG.info("Killing task : " + taskId.getValue());
-    try {
-      taskTracker.shutdown();
-    } catch (IOException e) {
-      LOG.error("Failed to shutdown TaskTracker", e);
-    } catch (InterruptedException e) {
-      LOG.error("Failed to shutdown TaskTracker", e);
+    if (taskTracker != null) {
+      LOG.info("Revoking task tracker map/reduce slots");
+      revokeSlots();
+
+      // Send the TASK_FINISHED status
+      new Thread("TaskFinishedUpdate") {
+        @Override
+        public void run() {
+          driver.sendStatusUpdate(TaskStatus.newBuilder()
+            .setTaskId(taskId)
+            .setState(TaskState.TASK_FINISHED)
+            .build());
+        }
+      }.start();
     }
   }
 
@@ -159,5 +180,97 @@ public class MesosExecutor implements Executor {
   @Override
   public void shutdown(ExecutorDriver d) {
     LOG.info("Executor asked to shutdown");
+  }
+
+  public void revokeSlots() {
+    if (taskTracker == null) {
+      LOG.error("Task tracker is not initialized");
+      return;
+    }
+
+    int maxMapSlots = 0;
+    int maxReduceSlots = 0;
+
+    // TODO(tarnfeld): Sanity check that it's safe for us to change the slots.
+    // Be sure there's nothing running and nothing in the launcher queue.
+
+    // If we expect to have no slots, let's go ahead and terminate the task launchers
+    if (maxMapSlots == 0) {
+      try {
+        Field launcherField = taskTracker.getClass().getDeclaredField("mapLauncher");
+        launcherField.setAccessible(true);
+
+        // Kill the current map task launcher
+        TaskTracker.TaskLauncher launcher = ((TaskTracker.TaskLauncher) launcherField.get(taskTracker));
+        launcher.notifySlots();
+        launcher.interrupt();
+      } catch (ReflectiveOperationException e) {
+        LOG.fatal("Failed updating map slots due to error with reflection", e);
+      }
+    }
+
+    if (maxReduceSlots == 0) {
+      try {
+        Field launcherField = taskTracker.getClass().getDeclaredField("reduceLauncher");
+        launcherField.setAccessible(true);
+
+        // Kill the current reduce task launcher
+        TaskTracker.TaskLauncher launcher = ((TaskTracker.TaskLauncher) launcherField.get(taskTracker));
+        launcher.notifySlots();
+        launcher.interrupt();
+      } catch (ReflectiveOperationException e) {
+        LOG.fatal("Failed updating reduce slots due to error with reflection", e);
+      }
+    }
+
+    // Configure the new slot counts on the task tracker
+    taskTracker.setMaxMapSlots(maxMapSlots);
+    taskTracker.setMaxReduceSlots(maxReduceSlots);
+
+    // If we have zero slots left, commit suicide when no jobs are running
+    if ((maxMapSlots + maxReduceSlots) == 0) {
+      scheduleSuicideTimer();
+    }
+  }
+
+  protected void scheduleSuicideTimer() {
+    timerScheduler.schedule(new Runnable() {
+      @Override
+      public void run() {
+        if (taskTracker == null) {
+          return;
+        }
+
+        LOG.info("Checking to see if TaskTracker is idle");
+
+        // If the task tracker is idle, all tasks have finished and task output
+        // has been cleaned up.
+        if (taskTracker.isIdle()) {
+          LOG.warn("TaskTracker is idle, terminating");
+
+          try {
+            taskTracker.shutdown();
+          } catch (IOException e) {
+            LOG.error("Failed to shutdown TaskTracker", e);
+          } catch (InterruptedException e) {
+            LOG.error("Failed to shutdown TaskTracker", e);
+          }
+        }
+        else {
+          try {
+            Field field = taskTracker.getClass().getDeclaredField("tasksToCleanup");
+            field.setAccessible(true);
+            BlockingQueue<TaskTrackerAction> tasksToCleanup = ((BlockingQueue<TaskTrackerAction>) field.get(taskTracker));
+            LOG.info("TaskTracker has " + taskTracker.tasks.size() +
+                     " running tasks and " + tasksToCleanup +
+                     " tasks to clean up.");
+          } catch (ReflectiveOperationException e) {
+            LOG.fatal("Failed to get task counts from TaskTracker", e);
+          }
+
+          scheduleSuicideTimer();
+        }
+      }
+    }, 1000, TimeUnit.MILLISECONDS);
   }
 }
